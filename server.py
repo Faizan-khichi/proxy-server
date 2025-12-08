@@ -2,31 +2,32 @@ import os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import urllib.request
 import urllib.error
+from urllib.parse import urlparse
 
 # --- Configuration ---
-# The base URL of the REAL target server. The path will be added automatically.
 BASE_TARGET_URL = "http://23.132.164.57" 
-
-# This port is set by the Render.com environment automatically.
 PORT = int(os.environ.get("PORT", 8080))
 
 class ProxyHandler(BaseHTTPRequestHandler):
     def handle_all_requests(self):
-        # Construct the full target URL by combining the base URL and the requested path
-        # Example: if request is for "/private/createacc.php", this becomes "http://23.132.164.57/private/createacc.php"
+        # Construct the full URL for the target server
         full_target_url = BASE_TARGET_URL + self.path
 
         # Read the body from the incoming request (from Cloudflare)
         content_length = int(self.headers.get('Content-Length', 0))
         request_body = self.rfile.read(content_length) if content_length > 0 else None
         
-        # Prepare headers to be sent to the REAL target server
+        # --- THE CRITICAL FIX IS HERE ---
+        # We spoof the Referer and Host headers to make the request look legitimate.
+        parsed_target = urlparse(full_target_url)
         headers_to_target = {
-            'User-Agent': self.headers.get('User-Agent', 'Python-Proxy'),
+            'Host': parsed_target.netloc, # Tells the server we are accessing its IP directly
+            'Referer': f"{parsed_target.scheme}://{parsed_target.netloc}/", # Pretend we came from the homepage
+            'User-Agent': self.headers.get('User-Agent', 'Python-Proxy/2.0'),
             'Cookie': self.headers.get('Cookie', ''),
             'Content-Type': self.headers.get('Content-Type', '')
         }
-        # Clean up empty headers
+        # Clean up any empty headers to avoid errors
         headers_to_target = {k: v for k, v in headers_to_target.items() if v}
 
         try:
@@ -34,39 +35,32 @@ class ProxyHandler(BaseHTTPRequestHandler):
             req = urllib.request.Request(full_target_url, data=request_body, headers=headers_to_target, method=self.command)
             
             with urllib.request.urlopen(req) as response:
-                # --- Send Response Back to Cloudflare ---
+                # Forward the response back to Cloudflare
                 self.send_response(response.status)
-                
-                # Forward all headers from the real server back to Cloudflare
                 for key, value in response.headers.items():
-                    self.send_header(key, value)
+                    # Avoid forwarding headers that can cause issues
+                    if key.lower() not in ['content-encoding', 'transfer-encoding', 'connection']:
+                        self.send_header(key, value)
                 self.end_headers()
-                
-                # Send the page content (HTML, JSON, etc.) back
                 self.wfile.write(response.read())
 
         except urllib.error.HTTPError as e:
-            # If the real server has an error, forward that error
             self.send_response(e.code)
             self.end_headers()
             self.wfile.write(e.read())
         except Exception as e:
-            # Handle any other connection errors
             self.send_response(502) # Bad Gateway
             self.end_headers()
             self.wfile.write(f"Proxy connection error: {e}".encode())
 
-    # Handle GET, POST, and any other methods with the same logic
-    def do_GET(self):
-        self.handle_all_requests()
-
-    def do_POST(self):
-        self.handle_all_requests()
-
-    def do_HEAD(self):
-        self.handle_all_requests()
+    # Use the same logic for all HTTP methods
+    do_GET = handle_all_requests
+    do_POST = handle_all_requests
+    do_HEAD = handle_all_requests
+    do_PUT = handle_all_requests
+    do_DELETE = handle_all_requests
 
 # --- Server Startup ---
-print(f"[*] Simple All-Rounder Proxy starting on port {PORT}")
+print(f"[*] All-Rounder Proxy (v2) starting on port {PORT}")
 server = HTTPServer(('0.0.0.0', PORT), ProxyHandler)
 server.serve_forever()
